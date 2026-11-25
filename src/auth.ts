@@ -4,13 +4,15 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { runQuery } from './dbconn.ts';
 import { type Staff } from './object/Staff.ts';
+import { checkPasswordRules, hashPassword } from './passwords.ts';
+import { logAudit } from './audit.ts';
 
-/** What we keep about the signed-in user (never includes the password hash). */
-export type AuthUser = Pick<Staff, 'staff_id' | 'first_name' | 'last_name' | 'access_level'>;
+/** Shared info about the signed-in user. */
+export type AuthUser = Pick<Staff, 'staff_id' | 'first_name' | 'last_name' | 'access_level' | 'must_change_password'>;
 
 const JWT_SECRET = process.env.JWT_SECRET;
 if (!JWT_SECRET || JWT_SECRET.length < 32) {
-    // Refuse to start with a missing/weak secret: anyone could forge tokens otherwise
+    // Refuse to start with a missing/weak secret: anyone could spoof tokens otherwise
     console.error('JWT_SECRET must be set in .env (at least 32 characters)');
     process.exit(1);
 }
@@ -21,13 +23,26 @@ const SESSION_MS = 60 * 60 * 1000; // 1 hour
 // Used when the email doesn't exist, so the response takes the same time either way
 const DUMMY_HASH = bcrypt.hashSync('not-a-real-password', 10);
 
+const USER_COLUMNS = 'staff_id, first_name, last_name, access_level, must_change_password';
+
+/** MySQL returns BOOL as 0/1; turn it into a real boolean for the frontend. */
+function toAuthUser(row: AuthUser): AuthUser {
+    return {
+        staff_id: row.staff_id,
+        first_name: row.first_name,
+        last_name: row.last_name,
+        access_level: row.access_level,
+        must_change_password: Boolean(row.must_change_password),
+    };
+}
+
 /** Loads an active user by id. Identity always comes from the DB, not from the client. */
 async function findActiveUser(staffId: number): Promise<AuthUser | null> {
     const rows = await runQuery<(AuthUser & RowDataPacket)[]>(
-        'SELECT staff_id, first_name, last_name, access_level FROM staff WHERE staff_id = ? AND is_active = TRUE',
+        `SELECT ${USER_COLUMNS} FROM staff WHERE staff_id = ? AND is_active = TRUE`,
         [staffId]
     );
-    return rows[0] ?? null;
+    return rows[0] ? toAuthUser(rows[0]) : null;
 }
 
 // ---------- Middleware ----------
@@ -36,8 +51,9 @@ async function findActiveUser(staffId: number): Promise<AuthUser | null> {
  * Lets the request through only with a valid token cookie.
  * Sets res.locals.user to the user freshly loaded from the database, so
  * demoted or deactivated staff lose access immediately.
+ * Does NOT check must_change_password (used by /me and /change-password).
  */
-export async function requireAuth(req: Request, res: Response, next: NextFunction) {
+export async function authenticate(req: Request, res: Response, next: NextFunction) {
     const token = req.cookies?.[COOKIE_NAME];
     if (!token) {
         return res.status(401).json({ error: 'Not signed in' });
@@ -66,10 +82,22 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
     }
 }
 
+/** Use on every data route: signed in AND has set their own password. */
+export function requireAuth(req: Request, res: Response, next: NextFunction) {
+    authenticate(req, res, () => {
+        const user = res.locals.user as AuthUser;
+        if (user.must_change_password) {
+            return res.status(403).json({ error: 'You must change your password first', code: 'PASSWORD_CHANGE_REQUIRED' });
+        }
+        next();
+    });
+}
+
 /** Use after requireAuth on any route that changes data. */
 export function requireManager(req: Request, res: Response, next: NextFunction) {
     const user = res.locals.user as AuthUser | undefined;
     if (user?.access_level !== 'manager') {
+        void logAudit(user?.staff_id ?? null, 'denied', 'staff', null, { method: req.method, path: req.originalUrl });
         return res.status(403).json({ error: 'Manager access required' });
     }
     next();
@@ -85,11 +113,11 @@ authRouter.post('/login', async (req: Request, res: Response) => {
         return res.status(400).json({ error: 'Email and password are required' });
     }
 
-    let staff: (Staff & RowDataPacket) | undefined;
+    let staff: (AuthUser & { password_hash: string } & RowDataPacket) | undefined;
     try {
-        const rows = await runQuery<(Staff & RowDataPacket)[]>(
-            'SELECT staff_id, first_name, last_name, access_level, password_hash FROM staff WHERE email = ? AND is_active = TRUE',
-            [email]
+        const rows = await runQuery<(AuthUser & { password_hash: string } & RowDataPacket)[]>(
+            `SELECT ${USER_COLUMNS}, password_hash FROM staff WHERE email = ? AND is_active = TRUE`,
+            [email.trim().toLowerCase()]
         );
         staff = rows[0];
     } catch (error) {
@@ -116,17 +144,48 @@ authRouter.post('/login', async (req: Request, res: Response) => {
         maxAge: SESSION_MS,
     });
 
-    const user: AuthUser = {
-        staff_id: staff.staff_id,
-        first_name: staff.first_name,
-        last_name: staff.last_name,
-        access_level: staff.access_level,
-    };
-    return res.json(user);
+    return res.json(toAuthUser(staff));
 });
 
-authRouter.get('/me', requireAuth, (req: Request, res: Response) => {
+authRouter.get('/me', authenticate, (req: Request, res: Response) => {
     res.json(res.locals.user);
+});
+
+authRouter.post('/change-password', authenticate, async (req: Request, res: Response) => {
+    const user = res.locals.user as AuthUser;
+    const { currentPassword, newPassword } = req.body ?? {};
+
+    if (typeof currentPassword !== 'string' || !currentPassword) {
+        return res.status(400).json({ error: 'Current password is required' });
+    }
+    const problem = checkPasswordRules(newPassword);
+    if (problem) {
+        return res.status(400).json({ error: problem });
+    }
+    if (newPassword === currentPassword) {
+        return res.status(400).json({ error: 'New password must be different from the current one' });
+    }
+
+    try {
+        const rows = await runQuery<({ password_hash: string } & RowDataPacket)[]>(
+            'SELECT password_hash FROM staff WHERE staff_id = ?',
+            [user.staff_id]
+        );
+        if (!rows[0] || !(await bcrypt.compare(currentPassword, rows[0].password_hash))) {
+            return res.status(400).json({ error: 'Current password is incorrect' });
+        }
+
+        await runQuery(
+            'UPDATE staff SET password_hash = ?, must_change_password = FALSE WHERE staff_id = ?',
+            [await hashPassword(newPassword), user.staff_id]
+        );
+        await logAudit(user.staff_id, 'update', 'staff', user.staff_id, { change: 'password' });
+
+        res.json({ ...user, must_change_password: false });
+    } catch (error) {
+        console.error('Change password failed:', error);
+        res.status(500).json({ error: 'Server error' });
+    }
 });
 
 authRouter.post('/logout', (req: Request, res: Response) => {

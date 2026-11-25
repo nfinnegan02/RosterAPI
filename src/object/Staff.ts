@@ -8,6 +8,7 @@ export type Staff = {
     min_rest_hours: number;
     max_weekly_hours?: number;
     is_active: boolean;
+    must_change_password: boolean;
     created_at: Date;
 };
 
@@ -21,5 +22,6 @@ export type Staff = {
 //   `min_rest_hours` tinyint NOT NULL DEFAULT 11,
 //   `max_weekly_hours` tinyint,
 //   `is_active` bool NOT NULL DEFAULT true,
+//   `must_change_password` bool NOT NULL DEFAULT false,
 //   `created_at` datetime NOT NULL DEFAULT (CURRENT_TIMESTAMP)
 // );

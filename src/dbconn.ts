@@ -71,3 +71,22 @@ export async function runFileQuery(filePath: string | URL): Promise<void> {
         await closeConnection(fileConn);   // closes only the temporary connection
     }
 }
+
+/**
+ * Runs several queries as one all-or-nothing unit on its own connection,
+ * so other requests' queries can't end up inside the transaction.
+ */
+export async function withTransaction<T>(work: (conn: Connection) => Promise<T>): Promise<T> {
+    const conn = await getConnection({ multipleStatements: false }); // options = new dedicated connection
+    try {
+        await conn.beginTransaction();
+        const result = await work(conn);
+        await conn.commit();
+        return result;
+    } catch (error) {
+        await conn.rollback();
+        throw error;
+    } finally {
+        await closeConnection(conn);
+    }
+}

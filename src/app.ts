@@ -3,6 +3,8 @@ import cookieParser from 'cookie-parser';
 import connection from './dbconn.ts';
 import { ensureSchema } from './initSchema.ts';
 import { authRouter } from './auth.ts';
+import { staffRouter, rolesRouter } from './staff.ts';
+import { ensureAdmin } from './seedAdmin.ts';
 
 const app: Express = express();
 
@@ -14,6 +16,8 @@ app.get('/', (req: Request, res: Response) => {
 });
 
 app.use('/api/auth', authRouter);
+app.use('/api/staff', staffRouter);
+app.use('/api/roles', rolesRouter);
 
 // Protect other routes like this:
 // app.get('/api/shifts', requireAuth, handler);
@@ -21,8 +25,9 @@ app.use('/api/auth', authRouter);
 
 try {
   await ensureSchema();
+  await ensureAdmin();
 } catch (error) {
-  console.error('Error ensuring schema:', error);
+  console.error('Error during startup:', error);
   process.exit(1);
 }
 
